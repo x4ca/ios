@@ -1,0 +1,16 @@
+--- variant A: -fuse-ld=lld
+ld64.lld: error: library not found for -lSystem
+clang: error: linker command failed with exit code 1 (use -v to see invocation)
+exitA=1
+--- variant B: --ld-path=ld64.lld
+ld64.lld: error: must specify -platform_version
+ld64.lld: error: missing or unsupported -arch arm64
+clang: error: linker command failed with exit code 1 (use -v to see invocation)
+exitB=1
+--- variant C: -nostdlib
+ld64.lld: error: must specify -platform_version
+ld64.lld: error: missing or unsupported -arch arm64
+clang: error: linker command failed with exit code 1 (use -v to see invocation)
+exitC=1
+xhs_probe.dylib: cannot open `xhs_probe.dylib' (No such file or directory)
+ls: cannot access 'xhs_probe.dylib': No such file or directory
