@@ -1,49 +1,98 @@
-// xhs_probe.c —— 只读内存，不做代码插桩（不会触发 iOS 的 CODESIGNING 击杀）
-//
-// 作用：dylib 加载时扫描本进程可写内存，找 "ss_handle"，把命中点前后各 2KB
-//       通过 TCP 发到电脑，同时写一份到 <HOME>/tmp/xhs_dump.txt
-//
-// 编译（macOS runner，Xcode SDK）：
-//   xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=13.0 \
-//         -dynamiclib -O2 -o xhs_probe.dylib xhs_probe.c \
-//         -framework Foundation -framework Security
+// xhs_probe.c —— 零系统头文件版（可在 Linux 上交叉编译成 iOS Mach-O）
+// 只读内存，不做代码插桩。扫 "ss_handle"，命中点前后 2KB 发 TCP + 写文件。
 
-#include <mach/mach.h>
-#include <mach/mach_vm.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <dlfcn.h>
+typedef unsigned int        u32;
+typedef unsigned long long  u64;
+typedef unsigned long       usize;
+typedef int                 i32;
 
-#define OUT_HOST "192.168.0.254"
-#define OUT_PORT 8088
-#define MAX_HITS 6
-#define CTX      0x800
+/* ---- libc ---- */
+extern void *malloc(usize);
+extern void  free(void *);
+extern void *memcpy(void *, const void *, usize);
+extern void *memset(void *, int, usize);
+extern usize strlen(const char *);
+extern char *getenv(const char *);
+extern int   getpid(void);
+extern int   snprintf(char *, usize, const char *, ...);
+extern int   open(const char *, int, ...);
+extern long  write(int, const void *, usize);
+extern int   close(int);
+extern int   socket(int, int, int);
+extern int   connect(int, const void *, unsigned int);
+extern long  send(int, const void *, usize, int);
+
+/* ---- mach ---- */
+typedef u32 mach_port_t;
+typedef int kern_return_t;
+typedef u64 mach_vm_address_t;
+typedef u64 mach_vm_size_t;
+typedef u32 mach_msg_type_number_t;
+
+extern mach_port_t mach_task_self_;
+extern kern_return_t mach_vm_region(mach_port_t, mach_vm_address_t *, mach_vm_size_t *,
+                                    int, void *, mach_msg_type_number_t *, mach_port_t *);
+extern kern_return_t mach_port_deallocate(mach_port_t, mach_port_t);
+
+struct vm_region_basic_info_64 {
+    int  protection;
+    int  max_protection;
+    u32  inheritance;
+    int  shared;
+    int  reserved;
+    u64  offset;
+    int  behavior;
+    unsigned short user_wired_count;
+};
+
+#define VM_REGION_BASIC_INFO_64        9
+#define VM_REGION_BASIC_INFO_COUNT_64  9
+#define VM_PROT_READ                   1
+#define KERN_SUCCESS                   0
+#define MACH_PORT_NULL                 0
+
+struct sockaddr_in_x {
+    unsigned char sin_len;
+    unsigned char sin_family;
+    unsigned short sin_port;
+    u32 sin_addr;
+    char pad[8];
+};
+
+#define AF_INET_X   2
+#define SOCK_STREAM_X 1
+#define OUT_HOST   0xFE00A8C0u   /* 192.168.0.254；小端存放即 C0 A8 00 FE */
+#define OUT_PORT_H 0x981Fu       /* 8088；小端存放即 1F 98 */
+#define MAX_HITS   6
+#define CTX        0x800
 
 static char *g_buf;
-static size_t g_len, g_cap;
+static usize g_len, g_cap;
 
-static void buf_init(void) { g_cap = 1u << 20; g_buf = malloc(g_cap); g_len = 0;
-                             if (g_buf) g_buf[0] = 0; }
-static void buf_add(const char *s, size_t n) {
+static void buf_init(void) {
+    g_cap = 1u << 20;
+    g_buf = (char *)malloc(g_cap);
+    g_len = 0;
+    if (g_buf) g_buf[0] = 0;
+}
+static void buf_add(const char *s, usize n) {
     if (!g_buf) return;
     if (g_len + n + 1 >= g_cap) return;
-    memcpy(g_buf + g_len, s, n); g_len += n; g_buf[g_len] = 0;
+    memcpy(g_buf + g_len, s, n);
+    g_len += n;
+    g_buf[g_len] = 0;
 }
 static void buf_str(const char *s) { buf_add(s, strlen(s)); }
-static void buf_hex(const unsigned char *p, size_t n) {
+static void buf_hex(const unsigned char *p, usize n) {
     static const char *H = "0123456789abcdef";
     char line[96];
-    for (size_t i = 0; i < n; i += 16) {
-        size_t k = 0; line[k++] = ' ';
-        for (size_t j = 0; j < 16 && i + j < n; j++) {
+    usize i, j, k;
+    for (i = 0; i < n; i += 16) {
+        k = 0; line[k++] = ' ';
+        for (j = 0; j < 16 && i + j < n; j++) {
             unsigned char c = p[i + j];
-            line[k++] = H[c >> 4]; line[k++] = H[c & 15];
+            line[k++] = H[c >> 4];
+            line[k++] = H[c & 15];
             line[k++] = (j == 7) ? '-' : ' ';
         }
         line[k++] = '\n';
@@ -52,23 +101,31 @@ static void buf_hex(const unsigned char *p, size_t n) {
     }
 }
 
-static void tcp_send(const char *tag, const char *body, size_t n) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+static void tcp_send(const char *tag, const char *body, usize n) {
+    int fd;
+    struct sockaddr_in_x a;
+    char head[256];
+    int hl;
+    usize off = 0;
+
+    fd = socket(AF_INET_X, SOCK_STREAM_X, 0);
     if (fd < 0) return;
-    struct sockaddr_in a; memset(&a, 0, sizeof(a));
-    a.sin_family = AF_INET; a.sin_port = htons(OUT_PORT);
-    a.sin_addr.s_addr = inet_addr(OUT_HOST);
-    if (connect(fd, (struct sockaddr *)&a, sizeof(a)) == 0) {
-        char head[256];
-        int hl = snprintf(head, sizeof(head),
-            "POST /%s HTTP/1.1\r\nHost: %s\r\nContent-Length: %zu\r\n"
-            "Connection: close\r\n\r\n", tag, OUT_HOST, n);
-        send(fd, head, (size_t)hl, 0);
-        size_t off = 0;
+
+    memset(&a, 0, sizeof(a));
+    a.sin_len = (unsigned char)sizeof(a);
+    a.sin_family = AF_INET_X;
+    a.sin_port = OUT_PORT_H;
+    a.sin_addr = OUT_HOST;
+
+    if (connect(fd, (const void *)&a, (unsigned int)sizeof(a)) == 0) {
+        hl = snprintf(head, sizeof(head),
+                      "POST /%s HTTP/1.1\r\nHost: x\r\nContent-Length: %lu\r\n"
+                      "Connection: close\r\n\r\n", tag, (unsigned long)n);
+        send(fd, head, (usize)hl, 0);
         while (off < n) {
-            ssize_t w = send(fd, body + off, n - off, 0);
+            long w = send(fd, body + off, n - off, 0);
             if (w <= 0) break;
-            off += (size_t)w;
+            off += (usize)w;
         }
     }
     close(fd);
@@ -76,63 +133,75 @@ static void tcp_send(const char *tag, const char *body, size_t n) {
 
 static void write_file(const char *text) {
     const char *home = getenv("HOME");
+    char path[512];
+    int fd;
+    usize n, off = 0;
     if (!home) return;
-    char path[1024];
     snprintf(path, sizeof(path), "%s/tmp/xhs_dump.txt", home);
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    fd = open(path, 1 /*O_WRONLY*/ | 0x200 /*O_CREAT*/ | 0x400 /*O_TRUNC*/, 0644);
     if (fd < 0) return;
-    size_t n = strlen(text), off = 0;
+    n = strlen(text);
     while (off < n) {
-        ssize_t w = write(fd, text + off, n - off);
+        long w = write(fd, text + off, n - off);
         if (w <= 0) break;
-        off += (size_t)w;
+        off += (usize)w;
     }
     close(fd);
 }
 
 __attribute__((constructor))
 static void xhs_probe_main(void) {
+    const char needle[10] = {'s','s','_','h','a','n','d','l','e',0};
+    const usize nlen = 9;
+    mach_vm_address_t addr = 0;
+    int hits = 0;
+    char tmp[256];
+    const char *home;
+
     buf_init();
     if (!g_buf) return;
 
     buf_str("=== xhs_probe v1 ===\n");
-    char tmp[256];
-    const char *home = getenv("HOME");
+    home = getenv("HOME");
     snprintf(tmp, sizeof(tmp), "home=%s\npid=%d\n", home ? home : "(null)", getpid());
     buf_str(tmp);
 
-    const char needle[] = "ss_handle";
-    const size_t nlen = sizeof(needle) - 1;
-    int hits = 0;
-
-    mach_vm_address_t addr = 0;
     while (hits < MAX_HITS) {
         mach_vm_size_t size = 0;
-        vm_region_basic_info_data_64_t info;
+        struct vm_region_basic_info_64 info;
         mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
         mach_port_t obj = MACH_PORT_NULL;
+        kern_return_t kr;
 
-        kern_return_t kr = mach_vm_region(mach_task_self(), &addr, &size,
-                                          VM_REGION_BASIC_INFO_64,
-                                          (vm_region_info_t)&info, &cnt, &obj);
-        if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
+        memset(&info, 0, sizeof(info));
+        kr = mach_vm_region(mach_task_self_, &addr, &size, VM_REGION_BASIC_INFO_64,
+                            (void *)&info, &cnt, &obj);
+        if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self_, obj);
         if (kr != KERN_SUCCESS) break;
 
         if ((info.protection & VM_PROT_READ) && size > 0 && size < (256ull << 20)) {
-            const unsigned char *p = (const unsigned char *)(uintptr_t)addr;
-            for (mach_vm_size_t i = 0; i + nlen < size; i++) {
-                if (p[i] == 's' && memcmp(p + i, needle, nlen) == 0) {
-                    hits++;
-                    snprintf(tmp, sizeof(tmp),
-                             "\n=== hit %d @ %p (region %p +0x%llx) ===\n",
-                             hits, (void *)(p + i), (void *)(uintptr_t)addr,
-                             (unsigned long long)i);
-                    buf_str(tmp);
-                    size_t start = (i > CTX) ? (size_t)(i - CTX) : 0;
-                    size_t end = (size_t)(i + nlen + CTX);
-                    if (end > (size_t)size) end = (size_t)size;
-                    buf_hex(p + start, end - start);
-                    if (hits >= MAX_HITS) break;
+            const unsigned char *p = (const unsigned char *)(usize)addr;
+            mach_vm_size_t i;
+            for (i = 0; i + nlen < size; i++) {
+                if (p[i] == 's') {
+                    /* 逐字节比较，避免引入 memcmp */
+                    usize k = 0;
+                    while (k < nlen && p[i + k] == (unsigned char)needle[k]) k++;
+                    if (k == nlen) {
+                        hits++;
+                        snprintf(tmp, sizeof(tmp),
+                                 "\n=== hit %d @ %p (region %p +0x%llx) ===\n",
+                                 hits, (void *)(p + i), (void *)(usize)addr,
+                                 (unsigned long long)i);
+                        buf_str(tmp);
+                        {
+                            usize s0 = (i > CTX) ? (usize)(i - CTX) : 0;
+                            usize e0 = (usize)(i + nlen + CTX);
+                            if (e0 > (usize)size) e0 = (usize)size;
+                            buf_hex(p + s0, e0 - s0);
+                        }
+                        if (hits >= MAX_HITS) break;
+                    }
                 }
             }
         }

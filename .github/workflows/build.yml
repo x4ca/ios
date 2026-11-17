@@ -12,33 +12,40 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Toolchain
+      - name: Install toolchain
         run: |
-          xcodebuild -version || true
-          xcrun --sdk iphoneos --show-sdk-path
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld
+          clang --version
+          ld64.lld --version || true
 
-      - name: Build dylib (arm64)
+      - name: Build iOS arm64 dylib (no SDK needed)
         run: |
-          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          xcrun --sdk iphoneos clang -arch arm64 \
-            -miphoneos-version-min=13.0 \
-            -isysroot "$SDK" \
-            -dynamiclib -O2 \
-            -o xhs_probe.dylib xhs_probe.c \
-            -framework Foundation
+          set -e
+          clang -target arm64-apple-ios13.0 \
+                -dynamiclib -O2 -fPIC \
+                -fuse-ld=lld \
+                -Wl,-undefined,dynamic_lookup \
+                -Wl,-platform_version -Wl,ios -Wl,13.0 -Wl,13.0 \
+                -o xhs_probe.dylib xhs_probe.c
           file xhs_probe.dylib
           ls -l xhs_probe.dylib
+          python3 - <<'PY'
+          import struct
+          d = open('xhs_probe.dylib','rb').read(32)
+          print('magic', d[:4].hex(), 'cputype', hex(struct.unpack('<I', d[4:8])[0]))
+          PY
 
-      - name: Commit dylib back to repo
+      - name: Commit dylib back
         run: |
           git config user.name  "github-actions"
           git config user.email "actions@github.com"
           git add -f xhs_probe.dylib
-          git commit -m "build: xhs_probe.dylib ($(date -u +%Y%m%d%H%M))" || echo "no change"
+          git commit -m "build: xhs_probe.dylib" || echo "no change"
           git push || echo "push failed"
 
       - uses: actions/upload-artifact@v4
