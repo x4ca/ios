@@ -1,5 +1,5 @@
 --- D: -nostdlib + -fuse-ld=lld
 exitD=0
 xhs_probe.dylib: Mach-O 64-bit arm64 dynamically linked shared library, flags:<NOUNDEFS|DYLDLINK|TWOLEVEL|NO_REEXPORTED_DYLIBS>
--rwxr-xr-x 1 runner runner 66936 Nov 17 12:14 xhs_probe.dylib
+-rwxr-xr-x 1 runner runner 66976 Nov 17 12:27 xhs_probe.dylib
 00000000: cffa edfe 0c00 0001 0000 0000 0600 0000  ................
