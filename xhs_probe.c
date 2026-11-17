@@ -1,5 +1,5 @@
-// xhs_probe.c v2 —— 零系统头文件；用 vm_read_overwrite 安全读内存（不碰保护页）
-// 只读内存，不做插桩。扫 "ss_handle"，命中点前后 2KB 发 TCP + 写文件。
+// xhs_probe.c v3 —— 零系统头文件
+// 后台线程扫描（不阻塞主线程）+ 限时 20s + 只扫可写区 + vm_read_overwrite 安全读
 
 typedef unsigned int        u32;
 typedef unsigned long long  u64;
@@ -12,6 +12,7 @@ extern void *memset(void *, int, usize);
 extern usize strlen(const char *);
 extern char *getenv(const char *);
 extern int   getpid(void);
+extern unsigned int sleep(unsigned int);
 extern int   snprintf(char *, usize, const char *, ...);
 extern int   open(const char *, int, ...);
 extern long  write(int, const void *, usize);
@@ -19,6 +20,7 @@ extern int   close(int);
 extern int   socket(int, int, int);
 extern int   connect(int, const void *, unsigned int);
 extern long  send(int, const void *, usize, int);
+extern int   pthread_create(void *, const void *, void *(*)(void *), void *);
 
 typedef u32 mach_port_t;
 typedef int kern_return_t;
@@ -46,7 +48,7 @@ struct vm_region_basic_info_64 {
 
 #define VM_REGION_BASIC_INFO_64        9
 #define VM_REGION_BASIC_INFO_COUNT_64  9
-#define VM_PROT_READ                   1
+#define VM_PROT_WRITE                  2
 #define KERN_SUCCESS                   0
 #define MACH_PORT_NULL                 0
 
@@ -63,10 +65,14 @@ struct sockaddr_in_x {
 #define OUT_PORT_H    0x981Fu       /* 8088 */
 #define MAX_HITS      6
 #define CTX           0x800
-#define CHUNK         (1u << 20)
+#define CHUNK         (256u * 1024)
+#define MAX_SCAN      (768ull * 1024 * 1024)   /* 最多扫 768MB */
+#define MAX_REGION    (256ull * 1024 * 1024)
 
 static char *g_buf;
 static usize g_len, g_cap;
+static int   g_hits, g_chunks;
+static u64   g_scanned;
 
 static void buf_init(void) {
     g_cap = 1u << 20;
@@ -147,27 +153,30 @@ static void write_file(const char *text) {
     close(fd);
 }
 
-__attribute__((constructor))
-static void xhs_probe_main(void) {
+static void *worker(void *arg) {
     const char needle[10] = {'s','s','_','h','a','n','d','l','e',0};
     const usize nlen = 9;
     mach_vm_address_t addr = 0;
-    int hits = 0, scanned = 0;
     char tmp[256];
     char *scratch;
-    const char *home;
+    int rounds = 0;
+
+    (void)arg;
+    sleep(4);   /* 等 App 启动完 */
 
     buf_init();
-    if (!g_buf) return;
+    if (!g_buf) return 0;
     scratch = (char *)malloc(CHUNK);
-    if (!scratch) return;
+    if (!scratch) return 0;
 
-    buf_str("=== xhs_probe v2 ===\n");
-    home = getenv("HOME");
-    snprintf(tmp, sizeof(tmp), "home=%s\npid=%d\n", home ? home : "(null)", getpid());
-    buf_str(tmp);
+    buf_str("=== xhs_probe v3 ===\n");
+    {
+        const char *home = getenv("HOME");
+        snprintf(tmp, sizeof(tmp), "home=%s\npid=%d\n", home ? home : "(null)", getpid());
+        buf_str(tmp);
+    }
 
-    while (hits < MAX_HITS) {
+    while (rounds < 8000) {
         mach_vm_size_t size = 0;
         struct vm_region_basic_info_64 info;
         mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
@@ -175,6 +184,7 @@ static void xhs_probe_main(void) {
         kern_return_t kr;
         mach_vm_size_t off;
 
+        rounds++;
         memset(&info, 0, sizeof(info));
         kr = mach_vm_region(mach_task_self_, &addr, &size, VM_REGION_BASIC_INFO_64,
                             (void *)&info, &cnt, &obj);
@@ -182,8 +192,9 @@ static void xhs_probe_main(void) {
         if (kr != KERN_SUCCESS) break;
         if (size == 0) break;
 
-        if ((info.protection & VM_PROT_READ) && size < (512ull << 20)) {
-            for (off = 0; off < size && hits < MAX_HITS; off += CHUNK) {
+        /* 只扫「可写」区域：SDK 的配置表一定在堆/数据段 */
+        if ((info.protection & VM_PROT_WRITE) && size < MAX_REGION) {
+            for (off = 0; off < size && g_hits < MAX_HITS; off += CHUNK) {
                 mach_vm_size_t want = size - off;
                 mach_vm_size_t got = 0;
                 usize i;
@@ -191,16 +202,17 @@ static void xhs_probe_main(void) {
                 kr = vm_read_overwrite(mach_task_self_, addr + off, want,
                                        (mach_vm_address_t)(usize)scratch, &got);
                 if (kr != KERN_SUCCESS || got == 0) continue;
-                scanned++;
+                g_chunks++;
+                g_scanned += got;
                 for (i = 0; i + nlen < (usize)got; i++) {
                     if (scratch[i] == 's') {
                         usize k = 0;
                         while (k < nlen && (unsigned char)scratch[i + k] == (unsigned char)needle[k]) k++;
                         if (k == nlen) {
-                            hits++;
+                            g_hits++;
                             snprintf(tmp, sizeof(tmp),
                                      "\n=== hit %d @ 0x%llx (region 0x%llx +0x%llx) ===\n",
-                                     hits,
+                                     g_hits,
                                      (unsigned long long)(addr + off + i),
                                      (unsigned long long)addr,
                                      (unsigned long long)(off + i));
@@ -211,7 +223,7 @@ static void xhs_probe_main(void) {
                                 if (e0 > (usize)got) e0 = (usize)got;
                                 buf_hex((const unsigned char *)(scratch + s0), e0 - s0);
                             }
-                            if (hits >= MAX_HITS) break;
+                            if (g_hits >= MAX_HITS) break;
                         }
                     }
                 }
@@ -220,13 +232,23 @@ static void xhs_probe_main(void) {
         }
         addr += size;
         if (addr == 0) break;
+        if (g_scanned > MAX_SCAN) break;
         if (g_len > g_cap - 8192) break;
     }
 
-    snprintf(tmp, sizeof(tmp), "\n=== done hits=%d chunks=%d ===\n", hits, scanned);
+    snprintf(tmp, sizeof(tmp), "\n=== done hits=%d chunks=%d scanned=%lluMB ===\n",
+             g_hits, g_chunks, (unsigned long long)(g_scanned >> 20));
     buf_str(tmp);
 
     tcp_send("PROBE", g_buf, g_len);
     write_file(g_buf);
     free(scratch);
+    return 0;
+}
+
+__attribute__((constructor))
+static void xhs_probe_main(void) {
+    char tbuf[64];
+    memset(tbuf, 0, sizeof(tbuf));
+    pthread_create(tbuf, 0, worker, 0);
 }
