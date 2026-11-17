@@ -7,15 +7,18 @@ on:
       - 'xhs_probe.c'
       - '.github/workflows/build.yml'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
-      - name: Show toolchain
+      - name: Toolchain
         run: |
-          xcodebuild -version
+          xcodebuild -version || true
           xcrun --sdk iphoneos --show-sdk-path
 
       - name: Build dylib (arm64)
@@ -24,11 +27,19 @@ jobs:
           xcrun --sdk iphoneos clang -arch arm64 \
             -miphoneos-version-min=13.0 \
             -isysroot "$SDK" \
-            -dynamiclib -O2 -fobjc-arc \
+            -dynamiclib -O2 \
             -o xhs_probe.dylib xhs_probe.c \
             -framework Foundation
           file xhs_probe.dylib
           ls -l xhs_probe.dylib
+
+      - name: Commit dylib back to repo
+        run: |
+          git config user.name  "github-actions"
+          git config user.email "actions@github.com"
+          git add -f xhs_probe.dylib
+          git commit -m "build: xhs_probe.dylib ($(date -u +%Y%m%d%H%M))" || echo "no change"
+          git push || echo "push failed"
 
       - uses: actions/upload-artifact@v4
         with:
