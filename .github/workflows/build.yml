@@ -22,34 +22,37 @@ jobs:
           sudo apt-get install -y -qq clang lld
           { clang --version; which ld64.lld; ld64.lld --version; } > toolchain.log 2>&1 || true
 
-      - name: Build (with logging)
+      - name: Build (variants)
         run: |
           set +e
           : > build.log
-          echo "--- variant A: -fuse-ld=lld" >> build.log
-          clang -target arm64-apple-ios13.0 -dynamiclib -O2 -fPIC \
+
+          echo "--- D: -nostdlib + -fuse-ld=lld" >> build.log
+          clang -target arm64-apple-ios13.0 -dynamiclib -O2 -fPIC -nostdlib \
                 -fuse-ld=lld -Wl,-undefined,dynamic_lookup \
                 -Wl,-platform_version -Wl,ios -Wl,13.0 -Wl,13.0 \
                 -o xhs_probe.dylib xhs_probe.c >> build.log 2>&1
-          echo "exitA=$?" >> build.log
+          echo "exitD=$?" >> build.log
 
           if [ ! -f xhs_probe.dylib ]; then
-            echo "--- variant B: --ld-path=ld64.lld" >> build.log
-            clang -target arm64-apple-ios13.0 -dynamiclib -O2 -fPIC \
-                  --ld-path=/usr/bin/ld64.lld -Wl,-undefined,dynamic_lookup \
-                  -o xhs_probe.dylib xhs_probe.c >> build.log 2>&1
-            echo "exitB=$?" >> build.log
-          fi
-
-          if [ ! -f xhs_probe.dylib ]; then
-            echo "--- variant C: -nostdlib" >> build.log
+            echo "--- E: 手工给 linker 加 -arch" >> build.log
             clang -target arm64-apple-ios13.0 -dynamiclib -O2 -fPIC -nostdlib \
-                  --ld-path=/usr/bin/ld64.lld -Wl,-undefined,dynamic_lookup \
+                  -fuse-ld=lld -Wl,-arch,arm64 -Wl,-undefined,dynamic_lookup \
+                  -Wl,-platform_version -Wl,ios -Wl,13.0 -Wl,13.0 \
                   -o xhs_probe.dylib xhs_probe.c >> build.log 2>&1
-            echo "exitC=$?" >> build.log
+            echo "exitE=$?" >> build.log
           fi
 
-          { file xhs_probe.dylib; ls -l xhs_probe.dylib; } >> build.log 2>&1
+          if [ ! -f xhs_probe.dylib ]; then
+            echo "--- F: 先生成 .o，再用 ld64.lld 手工链接" >> build.log
+            clang -target arm64-apple-ios13.0 -c -O2 -fPIC -o xhs_probe.o xhs_probe.c >> build.log 2>&1
+            echo "compile exit=$?" >> build.log
+            ld64.lld -arch arm64 -platform_version ios 13.0 13.0 \
+                     -dylib -undefined dynamic_lookup -o xhs_probe.dylib xhs_probe.o >> build.log 2>&1
+            echo "link exit=$?" >> build.log
+          fi
+
+          { file xhs_probe.dylib; ls -l xhs_probe.dylib; xxd -l 16 xhs_probe.dylib; } >> build.log 2>&1
           cat build.log
 
       - name: Commit artifacts and log
