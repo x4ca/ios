@@ -1,0 +1,36 @@
+name: build-xhs-probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'xhs_probe.c'
+      - '.github/workflows/build.yml'
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Build dylib (arm64)
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun --sdk iphoneos clang -arch arm64 \
+            -miphoneos-version-min=13.0 \
+            -isysroot "$SDK" \
+            -dynamiclib -O2 -fobjc-arc \
+            -o xhs_probe.dylib xhs_probe.c \
+            -framework Foundation
+          file xhs_probe.dylib
+          ls -l xhs_probe.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xhs_probe.dylib
+          path: xhs_probe.dylib
