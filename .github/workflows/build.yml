@@ -20,35 +20,43 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang lld
-          clang --version
-          ld64.lld --version || true
+          { clang --version; which ld64.lld; ld64.lld --version; } > toolchain.log 2>&1 || true
 
-      - name: Build iOS arm64 dylib (no SDK needed)
+      - name: Build (with logging)
         run: |
-          set -e
-          clang -target arm64-apple-ios13.0 \
-                -dynamiclib -O2 -fPIC \
-                -fuse-ld=lld \
-                -Wl,-undefined,dynamic_lookup \
+          set +e
+          : > build.log
+          echo "--- variant A: -fuse-ld=lld" >> build.log
+          clang -target arm64-apple-ios13.0 -dynamiclib -O2 -fPIC \
+                -fuse-ld=lld -Wl,-undefined,dynamic_lookup \
                 -Wl,-platform_version -Wl,ios -Wl,13.0 -Wl,13.0 \
-                -o xhs_probe.dylib xhs_probe.c
-          file xhs_probe.dylib
-          ls -l xhs_probe.dylib
-          python3 - <<'PY'
-          import struct
-          d = open('xhs_probe.dylib','rb').read(32)
-          print('magic', d[:4].hex(), 'cputype', hex(struct.unpack('<I', d[4:8])[0]))
-          PY
+                -o xhs_probe.dylib xhs_probe.c >> build.log 2>&1
+          echo "exitA=$?" >> build.log
 
-      - name: Commit dylib back
+          if [ ! -f xhs_probe.dylib ]; then
+            echo "--- variant B: --ld-path=ld64.lld" >> build.log
+            clang -target arm64-apple-ios13.0 -dynamiclib -O2 -fPIC \
+                  --ld-path=/usr/bin/ld64.lld -Wl,-undefined,dynamic_lookup \
+                  -o xhs_probe.dylib xhs_probe.c >> build.log 2>&1
+            echo "exitB=$?" >> build.log
+          fi
+
+          if [ ! -f xhs_probe.dylib ]; then
+            echo "--- variant C: -nostdlib" >> build.log
+            clang -target arm64-apple-ios13.0 -dynamiclib -O2 -fPIC -nostdlib \
+                  --ld-path=/usr/bin/ld64.lld -Wl,-undefined,dynamic_lookup \
+                  -o xhs_probe.dylib xhs_probe.c >> build.log 2>&1
+            echo "exitC=$?" >> build.log
+          fi
+
+          { file xhs_probe.dylib; ls -l xhs_probe.dylib; } >> build.log 2>&1
+          cat build.log
+
+      - name: Commit artifacts and log
         run: |
           git config user.name  "github-actions"
           git config user.email "actions@github.com"
-          git add -f xhs_probe.dylib
-          git commit -m "build: xhs_probe.dylib" || echo "no change"
+          git add -f build.log toolchain.log 2>/dev/null || true
+          git add -f xhs_probe.dylib 2>/dev/null || true
+          git commit -m "build: logs + dylib" || echo "no change"
           git push || echo "push failed"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: xhs_probe.dylib
-          path: xhs_probe.dylib
